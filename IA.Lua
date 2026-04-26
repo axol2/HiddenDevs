@@ -82,8 +82,8 @@ end
 
 --== MAIN PROCESSING LOOP ==--
 local SpottedPlayers = {}
-local State
 Slasher:SetAttribute("State", "Patrol")
+local State = Slasher:GetAttribute("State")
 local WhoIsChasing = nil
 local LastPlayerPos = nil
 local LastplayerSaw = nil
