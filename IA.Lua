@@ -57,7 +57,6 @@ end
 	Filters players based on distance, viewing angle, and visual obstructions.
 	
 	The vision cone uses the Dot Product formula:
-	$$\mathbf{a} \cdot \mathbf{b} = \cos(\theta)$$
 	This allows us to determine the angle between the Slasher's face and the player's position.
 ]]
 local function PlayersInFov()
