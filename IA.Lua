@@ -1,17 +1,20 @@
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 
-local Slasher = game.Workspace.Ia
+-- Model References
+local Slasher = workspace.Ia
 local SlasherHRP = Slasher.HumanoidRootPart
-
--- Force server-side ownership to prevent stuttering and network latency
-SlasherHRP:SetNetworkOwner(nil) 
-
 local SlasherHum = Slasher.Humanoid
-local InterestPointsF = game.Workspace.InterestPoints
 
---== SETTINGS & CONFIGURATION ==--
--- Tuning these variables allows for easy gameplay balance updates
+-- Ensure the server owns the physics to prevent client-side latency issues (rubber-banding)
+SlasherHRP:SetNetworkOwner(nil)
+
+-- Folder containing patrol waypoints
+local InterestPointsF = workspace.InterestPoints
+
+--== NAVIGATION & COMBAT CONFIGURATION ==--
+
+-- Agent parameters define the physical limitations of the AI during Pathfinding
 local AGENT_PARAMS = {
 	AgentRadius = 4,
 	AgentHeight = 5,
@@ -20,16 +23,22 @@ local AGENT_PARAMS = {
 }
 
 local Config = {
-	ViewDistance = 50,
-	HuntDistance = 150,
-	KillerFov = 130,
-	AttackDistance = 5,
-	Damage = 15,
+	ViewDistance = 50,    -- Max distance the AI can "see"
+	HuntDistance = 150,   -- Max tracking range for the "Hunt" state
+	KillerFov = 130,      -- The angle of the vision cone in degrees
+	AttackDistance = 5,   -- Melee attack range
+	Damage = 15,          -- HP subtracted per hit
 }
 
--- Helper to safely compute navigation paths, handling potential failure states
+--== NAVIGATION LOGIC ==--
+
+--[[
+	Calculates a path between two points using PathfindingService.
+	Utilizes pcall to safely handle potential service outages or computation errors.
+]]
 local function FindPath(startPos, endPos)
 	local path = PathfindingService:CreatePath(AGENT_PARAMS)
+
 	local success, errorMessage = pcall(function()
 		path:ComputeAsync(startPos, endPos)
 	end)
@@ -37,333 +46,370 @@ local function FindPath(startPos, endPos)
 	if success and path.Status == Enum.PathStatus.Success then
 		return path
 	else
-		warn("Pathfinding failed: " .. (errorMessage or tostring(path.Status)))
+		warn("Pathfinding failed to compute: " .. (errorMessage or tostring(path.Status)))
 		return nil
 	end
 end
 
---== VISION & PERCEPTION ==--
--- Identifies players within the Slasher's vision cone
+--== PERCEPTION & SENSES ==--
+
+--[[
+	Filters players based on distance, viewing angle, and visual obstructions.
+	
+	The vision cone uses the Dot Product formula:
+	$$\mathbf{a} \cdot \mathbf{b} = \cos(\theta)$$
+	This allows us to determine the angle between the Slasher's face and the player's position.
+]]
 local function PlayersInFov()
 	local fovPlayers = {}
 	if not SlasherHRP then return end
+
 	local HRPLookVector = SlasherHRP.CFrame.LookVector
 
 	for _, plr in pairs(Players:GetPlayers()) do		
 		local Char = plr.Character
-		if not plr.Character then continue end
+		if not Char then continue end
 
 		local HRP2 = Char:FindFirstChild("HumanoidRootPart")
 		if not HRP2 then continue end
 
-		-- Ignore players outside the maximum view distance for performance
+		-- Check 1: Radial Distance
 		if (SlasherHRP.Position - HRP2.Position).Magnitude > Config.ViewDistance then continue end
 
-		-- Calculate Dot Product to verify if the player is within the FOV angle
-		local Unit = (HRP2.Position - SlasherHRP.Position).Unit
-		local Dot = Unit:Dot(HRPLookVector)
+		-- Check 2: Angular Vision (Dot Product)
+		local UnitDirection = (HRP2.Position - SlasherHRP.Position).Unit
+		local Dot = UnitDirection:Dot(HRPLookVector)
+		Dot = math.clamp(Dot, -1, 1) -- Clamp to prevent precision errors in math.acos
 		local angle = math.deg(math.acos(Dot))
 
 		if angle <= Config.KillerFov / 2 then
-			-- Raycast to verify line-of-sight (ensures walls don't count as 'seeing' players)
+			-- Check 3: Line of Sight (Raycasting to detect walls/objects)
 			local Params = RaycastParams.new()
 			Params.FilterType = Enum.RaycastFilterType.Exclude
 			Params.FilterDescendantsInstances = {Slasher, Char}
 
+			-- Raycast starts slightly above the torso to avoid clipping the floor
 			local Raycast = workspace:Raycast(SlasherHRP.Position + Vector3.new(0, 2, 0), (HRP2.Position - SlasherHRP.Position), Params)
 
-			if Raycast then continue end
+			if Raycast then continue end -- Something is blocking the view
 
 			fovPlayers[plr.Name] = plr
 		end
 	end
+
 	return fovPlayers
 end
 
---== MAIN PROCESSING LOOP ==--
-local SpottedPlayers = {}
-Slasher:SetAttribute("State", "Patrol")
-local State = Slasher:GetAttribute("State")
-local WhoIsChasing = nil
-local LastPlayerPos = nil
-local LastplayerSaw = nil
+--== STATE MACHINE MANAGEMENT ==--
 
--- Dedicated loop to handle AI perception (runs frequently to keep AI responsive)
+local SpottedPlayers = {} 
+Slasher:SetAttribute("State", "Patrol") 
+
+local WhoIsChasing = nil   -- Current chase target
+local LastPlayerPos = nil  -- Stored for the "Search" state
+local LastplayerSaw = nil  -- Reference to the last player spotted
+
+-- Quick validation for target characters
+local function IsCharacterValid(char)
+	return char and char.Parent and char:FindFirstChild("HumanoidRootPart") and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0
+end
+
+-- Determines the highest priority target (closest) from the detected list
+local function CheckPlayers(HasPlayers, fovPlayers)
+	if not HasPlayers then return end
+
+	local nearestHRP = nil
+	local nearestDist = Config.ViewDistance + 1
+	local NewTable = {}
+
+	for _, plr in pairs(fovPlayers) do
+		local Char = plr.Character
+		if not IsCharacterValid(Char) then continue end
+
+		local HRP2 = Char:FindFirstChild("HumanoidRootPart")
+		local dist = (SlasherHRP.Position - HRP2.Position).Magnitude
+
+		if dist < nearestDist then
+			nearestDist = dist
+			nearestHRP = HRP2
+			LastplayerSaw = plr
+		end
+		NewTable[plr.Name] = plr
+	end
+
+	if nearestHRP then
+		WhoIsChasing = nearestHRP
+	end
+	SpottedPlayers = NewTable
+end
+
+-- The "Brain" tick: Runs continuously to monitor surroundings and trigger state changes
 local function KillerView()
 	local fovPlayers = PlayersInFov()
 	local HasPlayers = (next(fovPlayers) ~= nil)
 
-	local Nearest
-	local NearestDist = Config.ViewDistance + 1
+	CheckPlayers(HasPlayers, fovPlayers)
 
-	if HasPlayers then
-		for _, plr in pairs(fovPlayers) do
-			local Char = plr.Character
-			if not plr.Character then continue end
-			local HRP2 = Char:FindFirstChild("HumanoidRootPart")
-			if not HRP2 then continue end
-
-			if (HRP2.Position - SlasherHRP.Position).Magnitude < NearestDist then
-				NearestDist = (HRP2.Position - SlasherHRP.Position).Magnitude
-				Nearest = HRP2
-				WhoIsChasing = HRP2
-				LastplayerSaw = plr
-				SpottedPlayers[plr.Name] = plr
-			else
-				if SpottedPlayers[plr.Name] then SpottedPlayers[plr.Name] = nil end
-			end
+	for name, plr in pairs(SpottedPlayers) do
+		if not plr or not plr.Character or not plr.Parent then
+			SpottedPlayers[name] = nil
 		end
-	end
 
-	-- Logic for tracking visible and pathable players
-	for _, plr in pairs(SpottedPlayers) do
-		if not plr or not plr.Character or not plr.Parent then SpottedPlayers[plr.Name] = nil end
 		local Char = plr.Character
-		if not Char then continue end
+		if not IsCharacterValid(Char) then continue end
+
 		local HRP2 = Char:FindFirstChild("HumanoidRootPart")
-		if not HRP2 then continue end
+		local distance = (SlasherHRP.Position - HRP2.Position).Magnitude
 
-		local Distance = (HRP2.Position - SlasherHRP.Position).Magnitude
-		if Distance < Config.ViewDistance then
-			local Params = RaycastParams.new()
-			Params.FilterType = Enum.RaycastFilterType.Exclude
-			Params.FilterDescendantsInstances = {Slasher, Char}
-			local Raycast = workspace:Raycast(SlasherHRP.Position + Vector3.new(0, 2, 0), (HRP2.Position - SlasherHRP.Position), Params)
-
-			local WalkableDistance = 0
-			if Raycast then
-				-- If blocked, calculate path length instead of direct line distance
-				local Path = FindPath(SlasherHRP.Position, HRP2.Position)
-				if Path then
-					local PathPoints = Path:GetWaypoints()
-					for i, waypoint in pairs(PathPoints) do
-						if i > 1 then WalkableDistance += (waypoint.Position - PathPoints[i - 1].Position).Magnitude end
-					end
+		-- Verify if the path is physically reachable (prevents chasing through fences/glass)
+		local walkableDistance = distance
+		if HasObstacle(HRP2) then
+			local path = FindPath(SlasherHRP.Position, HRP2.Position)
+			if path then
+				local points = path:GetWaypoints()
+				walkableDistance = 0
+				for i = 2, #points do
+					walkableDistance += (points[i].Position - points[i - 1].Position).Magnitude
 				end
-			else
-				WalkableDistance = (HRP2.Position - SlasherHRP.Position).Magnitude
-			end
-
-			if WalkableDistance > Config.ViewDistance / 3 then WalkableDistance = 100000 end
-			if WalkableDistance < NearestDist then
-				Nearest = HRP2
-				NearestDist = Distance
 			end
 		end
-	end
 
-	-- Update State to Chase if a target is found
-	if Nearest and Nearest.Parent then
-		WhoIsChasing = Nearest
-		Slasher:SetAttribute("State", "Chase")
+		-- If the target is physically reachable within a reasonable distance, start the chase
+		if walkableDistance < Config.ViewDistance then
+			WhoIsChasing = HRP2
+			Slasher:SetAttribute("State", "Chase")
+		end
 	end
 end
 
+-- Global Perception Loop
 task.spawn(function()
-	while true do
-		task.wait(.3)
+	while Slasher and Slasher.Parent do
+		task.wait(0.3) -- Scanning frequency balanced for server performance
 		KillerView()
 	end
 end)
 
---== HELPER FUNCTIONS ==--
--- Standardized movement to prevent AI from getting stuck
+--== MOVEMENT HELPERS ==--
+
+--[[
+	Moves the NPC to a specific waypoint with jump support and a safety timeout.
+	Movement is interrupted if the AI's state changes during transit.
+]]
 local function MoveToPoint(targetPos, stateToCheck, NeedToJump)
 	if not targetPos then return end
-	targetPos = targetPos + Vector3.new(0, 3, 0)
-	
-	local startT = tick()
-	local Reached = false
+
+	targetPos = targetPos + Vector3.new(0, 3, 0) -- Slight Y-offset for precision
+
+	local startT = os.clock()
+	local reached = false
 	SlasherHum:MoveTo(targetPos)
+
 	if NeedToJump then Slasher.Humanoid.Jump = true end
-	
-	local Conn = SlasherHum.MoveToFinished:Once(function() Reached = true end)
-	
-	-- Movement loop with timeout and state validation
+
+	local Conn = SlasherHum.MoveToFinished:Once(function()
+		reached = true
+	end)
+
+	-- Wait loop with state-change cancellation and a 20-second stall timeout
 	repeat
-		task.wait(.1)
+		task.wait(0.1)
 		local currentDistance = (SlasherHRP.Position - targetPos).Magnitude
-	until Reached or currentDistance < 3.5 or (tick() - startT > 30) or State ~= stateToCheck
+	until reached or currentDistance < 3.5 or (os.clock() - startT > 20) or Slasher:GetAttribute("State") ~= stateToCheck
+	
 	if Conn then Conn:Disconnect() end
 end
 
--- Reusable check for line-of-sight
-local function CanSee(TargetHRP)
+-- Checks for physical obstructions between the Slasher and a target
+local function HasObstacle(TargetHRP)
 	local Params = RaycastParams.new()
 	Params.FilterType = Enum.RaycastFilterType.Exclude
 	Params.FilterDescendantsInstances = {Slasher, TargetHRP.Parent}
 	return workspace:Raycast(SlasherHRP.Position, (TargetHRP.Position - SlasherHRP.Position), Params)
 end
 
---== BEHAVIOR STATES ==--
-local LoopConn
+--== CORE BEHAVIORS ==--
+
+local LoopConn -- Current behavior thread (cancelled on state transition)
 local InterestPointsIndex = 1
 local ClosestCharacter
 
--- Patrol: Wandering between pre-defined interest points
+-- STATE: Patrol - AI wanders between set interest points
 local function PatrolBehavior()
-	if LoopConn then task.cancel(LoopConn) end
+	if LoopConn then task.cancel(LoopConn) LoopConn = nil end
+
 	LoopConn = task.spawn(function()
 		while Slasher:GetAttribute("State") == "Patrol" do
-			local CurrentInterestPoint = InterestPointsF:FindFirstChild(InterestPointsIndex)
-			if CurrentInterestPoint then
-				local Distance = (CurrentInterestPoint.Position - SlasherHRP.Position).Magnitude
-				if Distance < 10 then InterestPointsIndex += 1 return end
-				local Path = FindPath(SlasherHRP.Position, CurrentInterestPoint.Position)
-				if Path then
-					local Waypoints = Path:GetWaypoints()
-					for _, WPS in pairs(Waypoints) do
+			local Point = InterestPointsF:FindFirstChild(InterestPointsIndex)
+
+			if Point then
+				local dist = (Point.Position - SlasherHRP.Position).Magnitude
+				if dist < 10 then InterestPointsIndex += 1 continue end
+
+				local path = FindPath(SlasherHRP.Position, Point.Position)
+				if path then
+					for _, wp in pairs(path:GetWaypoints()) do
 						if Slasher:GetAttribute("State") ~= "Patrol" then return end
-						MoveToPoint(WPS.Position, "Patrol", WPS.Action == Enum.PathWaypointAction.Jump)
+						MoveToPoint(wp.Position, "Patrol", wp.Action == Enum.PathWaypointAction.Jump)
 					end
-					task.wait(math.random(1,3))
-					InterestPointsIndex += 1
-					
-					-- Look for nearby players after reaching an interest point
-					ClosestCharacter = nil
-					local ClosestDistance = Config.HuntDistance
-					for _, plrs in pairs(Players:GetPlayers()) do
-						if plrs.Character and plrs.Character:FindFirstChild("HumanoidRootPart") and plrs.Character:FindFirstChild("Humanoid") then
-							if plrs.Character.Humanoid.Health > 0 then
-								local dist = (plrs.Character.HumanoidRootPart.Position - CurrentInterestPoint.Position).Magnitude
-								if dist < ClosestDistance then
-									ClosestCharacter = plrs.Character
-									ClosestDistance = dist
-								end
-							end
+				end
+
+				task.wait(math.random(1, 2)) -- Idle time at point
+				InterestPointsIndex += 1
+
+				-- Check if any player is close to the interest point to trigger a "Hunt"
+				ClosestCharacter = nil
+				local closestDist = Config.HuntDistance
+				for _, plr in pairs(Players:GetPlayers()) do
+					if IsCharacterValid(plr.Character) then
+						local d = (plr.Character.HumanoidRootPart.Position - Point.Position).Magnitude
+						if d < closestDist then
+							ClosestCharacter = plr.Character
+							closestDist = d
 						end
 					end
-					if ClosestCharacter and Slasher:GetAttribute("State") == "Patrol" then Slasher:SetAttribute("State", "Hunt") end
+				end
+
+				if ClosestCharacter and Slasher:GetAttribute("State") == "Patrol" then
+					Slasher:SetAttribute("State", "Hunt")
 				end
 			else
 				task.wait(1)
-				InterestPointsIndex = 1
+				InterestPointsIndex = 1 -- Loop back to start of patrol
 			end
+			task.wait(0.3)
 		end
 	end)
 end
 
--- Hunt: Tracking a target after being alerted
+-- STATE: Hunt - Tracking a target's general location (indirect awareness)
 local function HuntBehavior()
-	local Distance = (SlasherHRP.Position - ClosestCharacter.HumanoidRootPart.Position).Magnitude
-	task.spawn(function()
-		while Slasher:GetAttribute("State") == "Hunt" do
-			if not ClosestCharacter or not ClosestCharacter.Parent then Slasher:SetAttribute("State", "Patrol") break end
-			if Distance > Config.HuntDistance then Slasher:SetAttribute("State", "Patrol") return end
-			if not ClosestCharacter:FindFirstChild("HumanoidRootPart") then Slasher:SetAttribute("State", "Patrol") break end
-			Distance = (SlasherHRP.Position - ClosestCharacter.HumanoidRootPart.Position).Magnitude
-			task.wait(0.5)
-		end
-	end)
+	if LoopConn then task.cancel(LoopConn) LoopConn = nil end
 
-	if LoopConn then task.cancel(LoopConn) end
 	LoopConn = task.spawn(function()
 		while Slasher:GetAttribute("State") == "Hunt" do
-			if not ClosestCharacter or not ClosestCharacter.Parent then Slasher:SetAttribute("State", "Patrol") break end
-			if Distance > Config.HuntDistance then Slasher:SetAttribute("State", "Patrol") return end
-			if not ClosestCharacter:FindFirstChild("HumanoidRootPart") then Slasher:SetAttribute("State", "Patrol") break end
+			if not IsCharacterValid(ClosestCharacter) then Slasher:SetAttribute("State", "Patrol") break end
 			
-			local RayC = CanSee(ClosestCharacter.HumanoidRootPart)
-			if not RayC then
+			local dist = (SlasherHRP.Position - ClosestCharacter.HumanoidRootPart.Position).Magnitude
+			if dist > Config.HuntDistance then Slasher:SetAttribute("State", "Patrol") return end
+
+			if not HasObstacle(ClosestCharacter.HumanoidRootPart) then
 				SlasherHum:MoveTo(ClosestCharacter.HumanoidRootPart.Position)
 			else
 				local path = FindPath(SlasherHRP.Position, ClosestCharacter.HumanoidRootPart.Position)
 				if path then
-					local WayPoints = path:GetWaypoints()
-					for i, v in pairs(WayPoints) do
-						MoveToPoint(v.Position, "Hunt", v.Action == Enum.PathWaypointAction.Jump)
+					for _, wp in pairs(path:GetWaypoints()) do
+						MoveToPoint(wp.Position, "Hunt", wp.Action == Enum.PathWaypointAction.Jump)
 					end
 				end
 			end
-			task.wait(0.1)
+			task.wait(0.3)
 		end
 	end)
 end
 
--- Chase: High-priority pursuit logic when target is visible
+-- STATE: Chase - Active pursuit with direct line of sight and combat logic
+local LastAttackTick = 0
 local function ChaseBehavior()
-	if LoopConn then task.cancel(LoopConn) end
+	if LoopConn then task.cancel(LoopConn) LoopConn = nil end
+
 	LoopConn = task.spawn(function()
 		while Slasher:GetAttribute("State") == "Chase" do
 			if not WhoIsChasing then Slasher:SetAttribute("State", "Search") return end
-			local Distance = (SlasherHRP.Position - WhoIsChasing.Position).Magnitude
-			if Distance > Config.ViewDistance then Slasher:SetAttribute("State", "Search") return end
-			
-			local RayC = CanSee(WhoIsChasing)
-			if RayC then
-				local Path = FindPath(SlasherHRP.Position, WhoIsChasing.Position)
-				if Path then
-					local WayPoints = Path:GetWaypoints()
-					if WayPoints[2] then MoveToPoint(WayPoints[2].Position, "Chase", WayPoints[2].Action == Enum.PathWaypointAction.Jump) end
+
+			local dist = (SlasherHRP.Position - WhoIsChasing.Position).Magnitude
+			if dist > Config.ViewDistance then Slasher:SetAttribute("State", "Search") return end
+
+			if HasObstacle(WhoIsChasing) then
+				-- Target lost behind cover; use pathfinding for the next waypoint
+				local path = FindPath(SlasherHRP.Position, WhoIsChasing.Position)
+				if path then
+					local wp = path:GetWaypoints()
+					local nextPt = wp[2] or wp[1]
+					MoveToPoint(nextPt.Position, "Chase", nextPt.Action == Enum.PathWaypointAction.Jump)
 				end
 			else
+				-- Target visible; charge directly
 				SlasherHum:MoveTo(WhoIsChasing.Position)
-				task.wait(0.1)
 			end
 			
-			-- Attack logic
-			Distance = (SlasherHRP.Position - WhoIsChasing.Position).Magnitude
-			if Distance < Config.AttackDistance then
-				local Hum = WhoIsChasing.Parent:FindFirstChild("Humanoid")
-				if Hum and Hum.Health > 0 then Hum:TakeDamage(Config.Damage) task.wait(0.5) end
+			-- Melee Attack Logic
+			if dist < Config.AttackDistance then
+				local hum = WhoIsChasing.Parent:FindFirstChild("Humanoid")
+				if hum and hum.Health > 0 and os.clock() - LastAttackTick > 1 then
+					LastAttackTick = os.clock()
+					hum:TakeDamage(Config.Damage)
+				end
 			end
-			LastPlayerPos = WhoIsChasing.Position
+
+			LastPlayerPos = WhoIsChasing.Position -- Store location in case they escape
+			task.wait(0.2)
 		end
 	end)
 end
 
--- Search: Area investigation when the target is lost
+-- STATE: Search - AI investigates the last known location and searches nearby random spots
 local function SearchBehavior()
-	if State ~= "Search" then return end
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {Slasher}
-	
-	if LastPlayerPos and LastplayerSaw then
-		if not LastplayerSaw.Character or not LastPlayerPos then return end
-		params.FilterDescendantsInstances = {Slasher, LastplayerSaw.Character}
-		local RayC = workspace:Raycast(SlasherHRP.Position, (LastPlayerPos - SlasherHRP.Position), params)
-		if RayC then
-			local Path = FindPath(SlasherHRP.Position, LastPlayerPos)
-			if Path then
-				local WayPoints = Path:GetWaypoints()
-				if State ~= "Search" then return end	
-				for i = 1, #WayPoints, 1 do MoveToPoint(WayPoints[i].Position, "Search", WayPoints[i].Action == Enum.PathWaypointAction.Jump) end
+	if Slasher:GetAttribute("State") ~= "Search" then return end
+	if not LastPlayerPos or not LastplayerSaw then Slasher:SetAttribute("State", "Patrol") return end
+
+	-- Phase 1: Move to the last seen coordinate
+	if HasObstacle(LastplayerSaw.Character.HumanoidRootPart) then
+		local path = FindPath(SlasherHRP.Position, LastPlayerPos)
+		if path then
+			for _, wp in pairs(path:GetWaypoints()) do
+				if Slasher:GetAttribute("State") ~= "Search" then return end
+				MoveToPoint(wp.Position, "Search", wp.Action == Enum.PathWaypointAction.Jump)
 			end
+		end
+	else
+		MoveToPoint(LastPlayerPos, "Search")
+	end
+
+	-- Phase 2: Search random nearby vectors (simulating investigation)
+	for i = 1, math.random(3, 5) do
+		if Slasher:GetAttribute("State") ~= "Search" then break end
+		local offset = Vector3.new(math.random(-15, 15), 0, math.random(-15, 15))
+		local searchTarget = SlasherHRP.Position + offset
+
+		-- Simple raycast to ensure we aren't searching inside a wall
+		local p = RaycastParams.new()
+		p.FilterType = Enum.RaycastFilterType.Exclude
+		p.FilterDescendantsInstances = {Slasher}
+		local ray = workspace:Raycast(SlasherHRP.Position, (searchTarget - SlasherHRP.Position), p)
+
+		if ray then
+			MoveToPoint(ray.Position + (ray.Normal * 2), "Search")
 		else
-			MoveToPoint(LastPlayerPos, "Search")
+			MoveToPoint(searchTarget, "Search")
 		end
+		task.wait(math.random(0.5, 1.5))
 	end
-	
-	-- Random searching movement
-	if State == "Search" then
-		for i = 1, math.random(3,5), 1 do
-			local RandomPos = Vector3.new(math.random(-15, 15), 0, math.random(-15, 15))
-			local RandomPoint = SlasherHRP.Position + RandomPos
-			params.FilterDescendantsInstances = {Slasher}
-			local RayC = workspace:Raycast(SlasherHRP.Position, (RandomPoint - SlasherHRP.Position), params)
-			if RayC then
-				local Position = RayC.Position + (RayC.Normal * 2)
-				MoveToPoint(Position, "Search")
-			else
-				MoveToPoint(RandomPoint, "Search")
-			end
-			task.wait(math.random(0.5, 1.5))
-		end
+
+	task.wait(1)
+	if Slasher:GetAttribute("State") == "Search" then
+		Slasher:SetAttribute("State", "Patrol")
 	end
-	
-	if State == "Search" then Slasher:SetAttribute("State", "Patrol") end
 end
 
--- State Dispatcher: Listens for changes to switch behaviors instantly
+--== INITIALIZATION ==--
+
 local function BehaviorChange()
-	State = Slasher:GetAttribute("State")
-	if State == "Patrol" then PatrolBehavior()
-	elseif State == "Hunt" then HuntBehavior()
-	elseif State == "Chase" then ChaseBehavior()
-	elseif State == "Search" then SearchBehavior()
+	local currentState = Slasher:GetAttribute("State")
+	
+	-- Clean up existing behavior threads before starting a new state
+	if LoopConn then
+		task.cancel(LoopConn)
+		LoopConn = nil
+	end
+	
+	if currentState == "Patrol" then PatrolBehavior()
+	elseif currentState == "Hunt" then HuntBehavior()
+	elseif currentState == "Chase" then ChaseBehavior()
+	elseif currentState == "Search" then SearchBehavior()
 	end
 end
 
+-- Connect state changes and initialize the machine
 Slasher:GetAttributeChangedSignal("State"):Connect(BehaviorChange)
 BehaviorChange()
